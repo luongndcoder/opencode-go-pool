@@ -102,6 +102,9 @@ export default function contribute(server: PluginServerContext) {
 
   server.on("agent.turn_ended", async (event) => {
     if (event.outcome.kind !== "failed") return;
+    log(
+      `turn failed on ${event.agent.id.slice(0, 8)}: ${event.outcome.error.code ?? "no-code"} ${event.outcome.error.message.slice(0, 140)}`,
+    );
     const config = readConfig();
     if (config.keys.length === 0) return;
     const pool = new KeyPool(poolDir(), config.keys, log);

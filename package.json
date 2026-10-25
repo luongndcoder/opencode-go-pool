@@ -15,7 +15,8 @@
     "shared/"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "devDependencies": {
     "@getpaseo/plugin": "0.13.0-beta.2",
@@ -25,6 +26,7 @@
     "react": "19.1.0",
     "react-native": "0.81.5",
     "typescript": "^5.9.3",
+    "vitest": "^5.0.5",
     "zod": "^4.4.3"
   }
 }
