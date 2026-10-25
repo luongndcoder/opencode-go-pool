@@ -13,9 +13,12 @@ import { KeyPool, maskKey } from "./server/pool";
  * the agent's next session open rides a fresh key — no per-agent account binding.
  *
  * Config lives in `$PASEO_HOME/opencode-go-pool/config.json`:
- *   { "keys": ["go-key-1", "go-key-2"], "providers": [], "autoRetry": true }
+ *   { "keys": ["go-key-1", "go-key-2"], "providers": [], "autoRetry": true, "strict": false }
  * `providers` empty means every provider id mentioning "opencode". Re-read on every hook, so
- * editing the file needs no daemon restart.
+ * editing the file needs no daemon restart. `strict` injects ONLY the pool key (test switch).
+ *
+ * Manual per-session switching: pin an agent to one key with the `opencode-go-pool.pin` RPC —
+ * session_open honors the pin over LRU until `opencode-go-pool.unpin` clears it.
  */
 
 const poolConfigSchema = z.object({
@@ -37,8 +40,12 @@ function paseoHome(): string {
   return raw.startsWith("~") ? path.join(homedir(), raw.slice(1)) : raw;
 }
 
+function poolDir(): string {
+  return path.join(paseoHome(), "opencode-go-pool");
+}
+
 function readConfig(): PoolConfig {
-  const configPath = path.join(paseoHome(), "opencode-go-pool", "config.json");
+  const configPath = path.join(poolDir(), "config.json");
   try {
     if (existsSync(configPath)) {
       return poolConfigSchema.parse(JSON.parse(readFileSync(configPath, "utf8")));
@@ -76,6 +83,35 @@ function reloadAgent(agentId: string): Promise<void> {
   });
 }
 
+/** Resolve a key given as the full secret or its `oc_s…1TCD`-style mask. */
+function resolveKeyMask(pool: KeyPool, keyOrMask: string): string | null {
+  return keyOrMask.includes("…") ? pool.resolveFullKey(keyOrMask) : keyOrMask;
+}
+
+/** The one auto-switch path: cool the key, then reopen the agent onto the next key. */
+async function failoverAgent(
+  pool: KeyPool,
+  config: PoolConfig,
+  agentId: string,
+  key: string,
+  kind: "window" | "auth",
+): Promise<"cooled" | "no-key" | "unknown-agent" | "noop"> {
+  const used = pool.keyForAgent(agentId);
+  if (!used && !pool.pinnedKey(agentId)) return "unknown-agent";
+  const until = pool.coolKey(key, kind);
+  log(
+    `key ${maskKey(key)} hit a ${kind} limit on ${agentId.slice(0, 8)}; cooling until ${new Date(until).toISOString()}`,
+  );
+  if (!config.autoRetry) return "cooled";
+  const next = pool.pickKey(agentId);
+  if (!next) {
+    log("no pool key left to retry on; the next session open uses default credentials");
+    return "no-key";
+  }
+  await reloadAgent(agentId);
+  return "cooled";
+}
+
 export default function contribute(server: PluginServerContext) {
   server.before("agent.session_open", ({ request }) => {
     const config = readConfig();
@@ -83,17 +119,18 @@ export default function contribute(server: PluginServerContext) {
       return;
     }
     const pool = new KeyPool(poolDir(), config.keys, log);
-    const picked = pool.pickKey();
+    const picked = pool.pickKey(request.agentId);
     if (!picked) {
       log(
         `all ${config.keys.length} pool keys are cooling down; ${request.provider} runs on its default credentials`,
       );
       return;
     }
-    pool.forgetAgent(request.agentId);
     pool.rememberAgent(request.agentId, picked.key);
+    const pinned = pool.pinnedKey(request.agentId);
     log(
       `${request.agentId.slice(0, 8)} (${request.provider}) runs on key ${maskKey(picked.key)}` +
+        (pinned === picked.key ? " [pinned]" : "") +
         (config.keys.length > 1 ? ` (pool of ${config.keys.length})` : ""),
     );
     return {
@@ -114,17 +151,7 @@ export default function contribute(server: PluginServerContext) {
     if (!used) return;
     const kind = classifyFailure(event.outcome.error.message, event.outcome.error.code);
     if (!kind) return;
-    const until = pool.coolKey(used.key, kind);
-    log(
-      `key ${maskKey(used.key)} hit a ${kind} limit on ${event.agent.id.slice(0, 8)}; cooling until ${new Date(until).toISOString()}`,
-    );
-    if (!config.autoRetry) return;
-    const next = pool.pickKey();
-    if (!next) {
-      log("no pool key left to retry on; the next session open uses default credentials");
-      return;
-    }
-    await reloadAgent(event.agent.id);
+    await failoverAgent(pool, config, event.agent.id, used.key, kind);
   });
 
   server.handle(
@@ -138,17 +165,65 @@ export default function contribute(server: PluginServerContext) {
       const pool = new KeyPool(poolDir(), config.keys, log);
       return {
         keys: pool.status(),
+        pins: pool.pins(),
         providers: config.providers,
         autoRetry: config.autoRetry,
+        strict: config.strict,
       };
     },
   );
 
-  return () => {};
-}
+  server.handle(
+    {
+      name: "opencode-go-pool.pin",
+      input: z.object({ agentId: z.string().min(1), key: z.string().min(1) }).strict(),
+      output: z.object({ ok: z.boolean() }),
+    },
+    ({ agentId, key }) => {
+      const config = readConfig();
+      const pool = new KeyPool(poolDir(), config.keys, log);
+      const resolved = resolveKeyMask(pool, key);
+      const ok = resolved ? pool.pinAgent(agentId, resolved) : false;
+      log(ok ? `pinned ${agentId.slice(0, 8)} to key ${maskKey(resolved!)}` : `pin failed for ${agentId.slice(0, 8)}: key not found`);
+      return { ok };
+    },
+  );
 
-function poolDir(): string {
-  return path.join(paseoHome(), "opencode-go-pool");
+  server.handle(
+    {
+      name: "opencode-go-pool.unpin",
+      input: z.object({ agentId: z.string().min(1) }).strict(),
+      output: z.object({ ok: z.boolean() }),
+    },
+    ({ agentId }) => {
+      const config = readConfig();
+      const pool = new KeyPool(poolDir(), config.keys, log);
+      const ok = pool.unpinAgent(agentId);
+      log(ok ? `unpinned ${agentId.slice(0, 8)}` : `unpin failed: ${agentId.slice(0, 8)} was not pinned`);
+      return { ok };
+    },
+  );
+
+  server.handle(
+    {
+      name: "opencode-go-pool.simulate-failure",
+      input: z
+        .object({ agentId: z.string().min(1), kind: z.enum(["window", "auth"]).default("window") })
+        .strict(),
+      output: z.object({ result: z.string() }),
+    },
+    async ({ agentId, kind }) => {
+      const config = readConfig();
+      const pool = new KeyPool(poolDir(), config.keys, log);
+      const used = pool.keyForAgent(agentId);
+      const key = used?.key ?? pool.pinnedKey(agentId);
+      if (!key) return { result: "unknown-agent" };
+      const result = await failoverAgent(pool, config, agentId, key, kind);
+      return { result };
+    },
+  );
+
+  return () => {};
 }
 
 function poolCovers(config: PoolConfig, provider: string): boolean {

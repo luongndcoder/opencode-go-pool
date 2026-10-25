@@ -14,6 +14,8 @@ export interface PoolState {
   keys: PoolKeyState[];
   /** agentId -> key currently injected into that agent's sessions. */
   agents: Record<string, string>;
+  /** agentId -> key the user pinned; session_open honors it over LRU. */
+  pins: Record<string, string>;
 }
 
 const WINDOW_COOLDOWN_MS = 60 * 60_000;
@@ -26,7 +28,7 @@ export function mainAuthPath(): string {
 
 export class KeyPool {
   private readonly statePath: string;
-  private state: PoolState = { keys: [], agents: {} };
+  private state: PoolState = { keys: [], agents: {}, pins: {} };
 
   constructor(
     stateDir: string,
@@ -60,7 +62,7 @@ export class KeyPool {
       if (existsSync(this.statePath)) {
         const parsed = JSON.parse(readFileSync(this.statePath, "utf8")) as PoolState;
         if (Array.isArray(parsed.keys) && typeof parsed.agents === "object") {
-          this.state = parsed;
+          this.state = { ...parsed, pins: parsed.pins ?? {} };
         }
       }
     } catch (error) {
@@ -78,16 +80,43 @@ export class KeyPool {
   }
 
   /** The least-recently-used key that is not cooling down; null when all are out. */
-  pickKey(): PoolKeyState | null {
+  pickKey(agentId?: string): PoolKeyState | null {
     const now = Date.now();
     const active = this.state.keys.filter((entry) => entry.coolingUntil <= now);
     if (active.length === 0) return null;
-    const picked = active.reduce((best, entry) =>
+    // A manual pin wins over LRU while its key is active.
+    const pin = agentId ? this.state.pins[agentId] : undefined;
+    const pinned = pin ? active.find((entry) => entry.key === pin) : undefined;
+    const picked = pinned ?? active.reduce((best, entry) =>
       entry.lastUsedAt < best.lastUsedAt ? entry : best,
     );
     picked.lastUsedAt = now;
     this.save();
     return picked;
+  }
+
+  /** Manual per-session account switch: pin an agent to one key. */
+  pinAgent(agentId: string, key: string): boolean {
+    if (!this.state.keys.some((entry) => entry.key === key)) return false;
+    this.state.pins[agentId] = key;
+    this.save();
+    return true;
+  }
+
+  unpinAgent(agentId: string): boolean {
+    if (!this.state.pins[agentId]) return false;
+    delete this.state.pins[agentId];
+    this.save();
+    return true;
+  }
+
+  /** Full key for a `oc_s…1TCD`-style mask, or null. */
+  resolveFullKey(mask: string): string | null {
+    return this.state.keys.find((entry) => maskKey(entry.key) === mask)?.key ?? null;
+  }
+
+  pinnedKey(agentId: string): string | null {
+    return this.state.pins[agentId] ?? null;
   }
 
   /**
@@ -161,6 +190,12 @@ export class KeyPool {
       coolingReason: entry.coolingUntil > Date.now() ? entry.coolingReason : null,
       lastUsedAt: entry.lastUsedAt,
     }));
+  }
+
+  pins(): Record<string, string> {
+    return Object.fromEntries(
+      Object.entries(this.state.pins).map(([agent, key]) => [agent, maskKey(key)]),
+    );
   }
 }
 

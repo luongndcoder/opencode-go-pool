@@ -83,3 +83,14 @@ test("maskKey never leaks the full key", () => {
   expect(maskKey("sk-ant-very-long-secret-key-1234")).not.toContain("very-long-secret");
   expect(maskKey("ab")).toBe("****");
 });
+
+test("pin overrides LRU and clears on unpin", () => {
+  const pool = new KeyPool(stateDir, ["key-a", "key-b"], log);
+  expect(pool.pickKey()?.key).toBe("key-a"); // LRU default
+  expect(pool.pinAgent("agent-1", "key-b")).toBe(true);
+  expect(pool.pinAgent("agent-1", "missing-key")).toBe(false);
+  expect(pool.pickKey("agent-1")?.key).toBe("key-b"); // pin wins
+  expect(pool.pickKey("agent-2")?.key).toBe("key-a"); // others keep LRU
+  expect(pool.unpinAgent("agent-1")).toBe(true);
+  expect(pool.pinnedKey("agent-1")).toBeNull();
+});
