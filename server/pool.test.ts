@@ -1,8 +1,8 @@
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { KeyPool, maskKey } from "./pool.js";
+import { ensurePiHome, KeyPool, maskKey } from "./pool.js";
 
 let stateDir: string;
 const log = () => {};
@@ -93,4 +93,31 @@ test("pin overrides LRU and clears on unpin", () => {
   expect(pool.pickKey("agent-2")?.key).toBe("key-a"); // others keep LRU
   expect(pool.unpinAgent("agent-1")).toBe(true);
   expect(pool.pinnedKey("agent-1")).toBeNull();
+});
+
+test("ensurePiHome symlinks the real agent dir and merges the pool key into auth.json", () => {
+  const fakeAgentDir = mkdtempSync(path.join(tmpdir(), "pi-agent-"));
+  writeFileSync(path.join(fakeAgentDir, "auth.json"), JSON.stringify({ "opencode-go": { type: "api_key", key: "real" }, "google-vertex": { type: "api_key", key: "vtx" } }));
+  writeFileSync(path.join(fakeAgentDir, "models.json"), "{}");
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  const previousBase = process.env.PASEO_GO_POOL_DIR;
+  process.env.PI_CODING_AGENT_DIR = fakeAgentDir;
+  process.env.PASEO_GO_POOL_DIR = stateDir; // keep pi homes out of the real paseo home
+  try {
+    const home = ensurePiHome("pool-key-1", log);
+    expect(home).toContain(path.join("pi-homes", "d0a8bb8017"));
+    // models.json is a symlink into the real dir; auth.json is a real merged file
+    const auth = JSON.parse(readFileSync(path.join(home, "auth.json"), "utf8"));
+    expect(auth["opencode-go"]).toEqual({ type: "api_key", key: "pool-key-1" });
+    expect(auth["google-vertex"]).toEqual({ type: "api_key", key: "vtx" });
+    expect(lstatSync(path.join(home, "models.json")).isSymbolicLink()).toBe(true);
+    // same key → same home, idempotent
+    expect(ensurePiHome("pool-key-1", log)).toBe(home);
+  } finally {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+    if (previousBase === undefined) delete process.env.PASEO_GO_POOL_DIR;
+    else process.env.PASEO_GO_POOL_DIR = previousBase;
+    rmSync(fakeAgentDir, { recursive: true, force: true });
+  }
 });

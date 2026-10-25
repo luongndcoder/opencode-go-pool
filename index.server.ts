@@ -5,7 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 import type { PluginServerContext } from "@getpaseo/plugin/server";
 import { classifyFailure } from "./server/failure";
-import { KeyPool, maskKey } from "./server/pool";
+import { ensurePiHome, KeyPool, maskKey } from "./server/pool";
 
 /**
  * OpenCode Go key pool at the provider level: every agent whose provider the pool covers runs
@@ -113,30 +113,53 @@ async function failoverAgent(
 }
 
 export default function contribute(server: PluginServerContext) {
+  /** Shared env injection for one picked key, by CLI family. */
+  function injectFor(provider: string, agentId: string, env: Record<string, string>): Record<string, string> {
+    const config = readConfig();
+    if (config.keys.length === 0 || !poolCovers(config, provider)) {
+      return env;
+    }
+    const pool = new KeyPool(poolDir(), config.keys, log);
+    const picked = pool.pickKey(agentId);
+    if (!picked) {
+      log(
+        `all ${config.keys.length} pool keys are cooling down; ${provider} runs on its default credentials`,
+      );
+      return env;
+    }
+    if (agentId) {
+      pool.rememberAgent(agentId, picked.key);
+    }
+    const pinned = pool.pinnedKey(agentId);
+    const family = familyOf(provider);
+    log(
+      `${agentId.slice(0, 8)} (${provider}, ${family}) runs on key ${maskKey(picked.key)}` +
+        (pinned === picked.key ? " [pinned]" : "") +
+        (config.keys.length > 1 ? ` (pool of ${config.keys.length})` : ""),
+    );
+    // OpenCode takes its auth through OPENCODE_AUTH_CONTENT; pi has no auth-content env, so the
+    // pool redirects PI_CODING_AGENT_DIR to a per-key home whose auth.json carries the key.
+    return family === "pi"
+      ? { ...env, PI_CODING_AGENT_DIR: ensurePiHome(picked.key, log) }
+      : { ...env, OPENCODE_AUTH_CONTENT: pool.authContent(picked.key, config.strict) };
+  }
+
+  server.before("agent.create", ({ request }) => {
+    log(`agent.create hook: provider=${request.config.provider ?? "?"}`);
+    const provider = request.config.provider ?? "";
+    if (!provider) return;
+    const env = injectFor(provider, "", request.env ?? {});
+    return { ...request, env };
+  });
+
   server.before("agent.session_open", ({ request }) => {
+    log(`session_open hook: provider=${request.provider} reason=${request.reason}`);
     const config = readConfig();
     if (config.keys.length === 0 || !poolCovers(config, request.provider)) {
       return;
     }
-    const pool = new KeyPool(poolDir(), config.keys, log);
-    const picked = pool.pickKey(request.agentId);
-    if (!picked) {
-      log(
-        `all ${config.keys.length} pool keys are cooling down; ${request.provider} runs on its default credentials`,
-      );
-      return;
-    }
-    pool.rememberAgent(request.agentId, picked.key);
-    const pinned = pool.pinnedKey(request.agentId);
-    log(
-      `${request.agentId.slice(0, 8)} (${request.provider}) runs on key ${maskKey(picked.key)}` +
-        (pinned === picked.key ? " [pinned]" : "") +
-        (config.keys.length > 1 ? ` (pool of ${config.keys.length})` : ""),
-    );
-    return {
-      ...request,
-      env: { ...request.env, OPENCODE_AUTH_CONTENT: pool.authContent(picked.key, config.strict) },
-    };
+    const env = injectFor(request.provider, request.agentId, request.env);
+    return { ...request, env };
   });
 
   server.on("agent.turn_ended", async (event) => {
@@ -228,7 +251,16 @@ export default function contribute(server: PluginServerContext) {
 
 function poolCovers(config: PoolConfig, provider: string): boolean {
   if (config.providers.length === 0) {
-    return provider.toLowerCase().includes("opencode");
+    // Token match: "copilot" contains "pi" and must not match by substring.
+    const tokens = provider.toLowerCase().split(/[^a-z0-9]+/);
+    return tokens.includes("opencode") || tokens.includes("pi");
   }
   return config.providers.includes(provider);
+}
+
+type CliFamily = "opencode" | "pi";
+
+function familyOf(provider: string): CliFamily {
+  const tokens = provider.toLowerCase().split(/[^a-z0-9]+/);
+  return tokens.includes("pi") ? "pi" : "opencode";
 }

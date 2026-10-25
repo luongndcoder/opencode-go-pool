@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 
@@ -24,6 +25,60 @@ const AUTH_COOLDOWN_MS = 24 * 60 * 60_000;
 /** The user's own OpenCode credentials; the pool key rides on top of them. */
 export function mainAuthPath(): string {
   return path.join(homedir(), ".local", "share", "opencode", "auth.json");
+}
+
+/** Pi keeps its keys in `<agentDir>/auth.json`; `PI_CODING_AGENT_DIR` relocates the whole dir. */
+export function piAgentDir(): string {
+  return process.env.PI_CODING_AGENT_DIR?.replace(/^~/, homedir()) ?? path.join(homedir(), ".pi", "agent");
+}
+
+function piHomeId(key: string): string {
+  return createHash("sha1").update(key).digest("hex").slice(0, 10);
+}
+
+/**
+ * Per-key Pi home: symlinks every entry of the real agent dir except auth.json (which becomes
+ * a merged per-key file), so models, extensions and settings stay shared while the key rotates.
+ * Returns the dir to hand to pi via PI_CODING_AGENT_DIR. Idempotent per key.
+ */
+export function ensurePiHome(key: string, log: (message: string, ...rest: unknown[]) => void): string {
+  const real = piAgentDir();
+  const baseDir = process.env.PASEO_GO_POOL_DIR?.replace(/^~/, homedir())
+    ?? path.join(homedir(), ".paseo", "opencode-go-pool");
+  const home = path.join(baseDir, "pi-homes", piHomeId(key));
+  mkdirSync(home, { recursive: true });
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(real);
+  } catch (error) {
+    log("could not read the pi agent dir; pi sessions keep their default home", error);
+    return real;
+  }
+  for (const entry of entries) {
+    if (entry === "auth.json") continue;
+    const target = path.join(home, entry);
+    if (existsSync(target)) continue;
+    try {
+      symlinkSync(path.join(real, entry), target);
+    } catch (error) {
+      log(`could not symlink pi dir entry ${entry}`, error);
+    }
+  }
+  // Merged per-key auth: the pool key wins for opencode-go; the user's other providers stay.
+  let merged: Record<string, unknown> = {};
+  try {
+    merged = JSON.parse(readFileSync(path.join(real, "auth.json"), "utf8")) as Record<string, unknown>;
+  } catch (error) {
+    log("could not read the pi auth.json; injecting only the pool key", error);
+  }
+  merged["opencode-go"] = { type: "api_key", key };
+  writeFileSync(path.join(home, "auth.json"), JSON.stringify(merged, null, 2), { mode: 0o600 });
+  return home;
+}
+
+/** Drops a per-key pi home (called when a key leaves the pool). */
+export function removePiHome(key: string): void {
+  rmSync(path.join(homedir(), ".paseo", "opencode-go-pool", "pi-homes", piHomeId(key)), { recursive: true, force: true });
 }
 
 export class KeyPool {
