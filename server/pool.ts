@@ -90,8 +90,15 @@ export class KeyPool {
     return picked;
   }
 
-  /** OpenCode Go credentials the user already has, so other providers keep working. */
-  authContent(key: string): string {
+  /**
+   * OpenCode Go credentials the agent runs on. Default merges the user's own providers so they
+   * keep working; `strict` injects ONLY the pool key — the test switch that proves the injected
+   * environment reaches the opencode process (a broken key then fails loudly).
+   */
+  authContent(key: string, strict = false): string {
+    if (strict) {
+      return JSON.stringify({ "opencode-go": { type: "api", key } });
+    }
     let main: Record<string, unknown> = {};
     try {
       if (existsSync(mainAuthPath())) {

@@ -21,3 +21,8 @@ test("unrelated failures return null", () => {
   expect(classifyFailure("model returned an empty response")).toBeNull();
   expect(classifyFailure("command timed out")).toBeNull();
 });
+
+test("entitlement / subscription errors classify as auth", () => {
+  expect(classifyFailure("OpenCode Go subscription required.")).toBe("auth");
+  expect(classifyFailure("EntitlementError: no active plan")).toBe("auth");
+});

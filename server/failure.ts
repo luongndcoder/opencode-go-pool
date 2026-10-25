@@ -4,7 +4,10 @@ export function classifyFailure(
   code?: string,
 ): "window" | "auth" | null {
   const haystack = `${code ?? ""} ${message}`.toLowerCase();
-  if (/(^|\D)(401|403)(\D|$)/.test(haystack) || /unauthorized|invalid api key|api key.*(invalid|expired)|signed out|forbidden/.test(haystack)) {
+  if (
+    /(^|\D)(401|403)(\D|$)/.test(haystack) ||
+    /unauthorized|invalid api key|api key.*(invalid|expired)|signed out|forbidden|entitlement|subscription required/.test(haystack)
+  ) {
     return "auth";
   }
   if (

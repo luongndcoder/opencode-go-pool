@@ -22,12 +22,14 @@ const poolConfigSchema = z.object({
   keys: z.array(z.string().trim().min(1)).default([]),
   providers: z.array(z.string().trim().min(1)).default([]),
   autoRetry: z.boolean().default(true),
+  strict: z.boolean().default(false),
 });
 
 interface PoolConfig {
   keys: string[];
   providers: string[];
   autoRetry: boolean;
+  strict: boolean;
 }
 
 function paseoHome(): string {
@@ -44,7 +46,7 @@ function readConfig(): PoolConfig {
   } catch (error) {
     console.error("[opencode-go-pool] invalid config.json:", error);
   }
-  return { keys: [], providers: [], autoRetry: true };
+  return { keys: [], providers: [], autoRetry: true, strict: false };
 }
 
 function log(message: string, ...rest: unknown[]): void {
@@ -96,7 +98,7 @@ export default function contribute(server: PluginServerContext) {
     );
     return {
       ...request,
-      env: { ...request.env, OPENCODE_AUTH_CONTENT: pool.authContent(picked.key) },
+      env: { ...request.env, OPENCODE_AUTH_CONTENT: pool.authContent(picked.key, config.strict) },
     };
   });
 
