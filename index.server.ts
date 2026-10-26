@@ -144,13 +144,18 @@ export default function contribute(server: PluginServerContext) {
       : { ...env, OPENCODE_AUTH_CONTENT: pool.authContent(picked.key, config.strict) };
   }
 
-  server.before("agent.create", ({ request }) => {
-    log(`agent.create hook: provider=${request.config.provider ?? "?"}`);
-    const provider = request.config.provider ?? "";
-    if (!provider) return;
-    const env = injectFor(provider, "", request.env ?? {});
-    return { ...request, env };
-  });
+  // Older daemons may not know this hook; pi still gets covered at session_open there.
+  try {
+    server.before("agent.create", ({ request }) => {
+      log(`agent.create hook: provider=${request.config.provider ?? "?"}`);
+      const provider = request.config.provider ?? "";
+      if (!provider) return;
+      const env = injectFor(provider, "", request.env ?? {});
+      return { ...request, env };
+    });
+  } catch (error) {
+    log("agent.create hook unavailable on this daemon; pi coverage rides on session_open", error);
+  }
 
   server.before("agent.session_open", ({ request }) => {
     log(`session_open hook: provider=${request.provider} reason=${request.reason}`);
